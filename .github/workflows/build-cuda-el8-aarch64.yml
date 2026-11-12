@@ -441,7 +441,7 @@ jobs:
         run: |
           "$PYTHON" packaging/package_engine.py --verify "$STRATA_PKG"
           "$PYTHON" packaging/binary_deps.py "$STRATA_PKG"
-          packaging/el8/verify-engine.sh "$STRATA_PKG" "$GLIBC_MAX"
+          sh packaging/el8/verify-engine.sh "$STRATA_PKG" "$GLIBC_MAX"
           echo "== dynamic section of the engine =="
           readelf -d "$STRATA_PKG/strata" | grep -E 'NEEDED|RPATH|RUNPATH'
           echo "== what the host must still provide =="
