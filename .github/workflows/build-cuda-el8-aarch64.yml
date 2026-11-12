@@ -14,16 +14,20 @@ name: Build Strata engine (EL8 / aarch64 / CUDA 13 / NVFP4)
 #   NVFP4 models come from HuggingFace as ready-made GGUF; no local ModelOpt
 #   conversion (tools/nvfp4_local_pack.py / torch) is needed on this box.
 #
-# Deliverables (both are tar.gz artifacts, no RPM):
+# Deliverables (all tar.gz, no RPM):
 #   1. strata-engine-<ver>-el8-aarch64-cuda13-nvfp4.tar.gz
 #      The C++ engine in Strata's own engine-component layout: strata,
-#      libstrata_kq.so, optionally strata-dsv41 and strata-vision, the CUDA
-#      runtime libraries, EL8's libstdc++/libgomp, BUILD.json,
-#      SYSTEM-LIBS.txt, engine-component.json, DEPLOY.txt and the two check
-#      scripts. Unpack it and it is usable with the Python CLI layer.
-#   2. strata-pydeps-<ver>-py311-aarch64-el8.tar.gz (optional, separate job)
+#      libstrata_kq.so, strata-dsv41, strata-vision, the CUDA runtime
+#      libraries, EL8's libstdc++/libgomp, BUILD.json, SYSTEM-LIBS.txt,
+#      engine-component.json, DEPLOY.txt and the two check scripts.
+#   2. strata-pydeps-<ver>-py311-aarch64-el8.tar.gz
 #      An offline wheelhouse for the Python CLI/API-server dependencies. It is
 #      NOT part of the engine package; see DEPLOY.txt for why it exists.
+#   3. optional: with `release_tag` set, both are attached to that GitHub
+#      Release. See the publish job for why this starts no other workflow.
+#
+# Defaults build the full engine (dsv41 + vision + wheelhouse); set any of
+# build_dsv41 / build_vision / with_python_wheels to 'false' for a faster run.
 
 on:
   workflow_dispatch:
@@ -41,12 +45,12 @@ on:
       build_dsv41:
         description: 'Also build strata-dsv41 (DeepSeek-V4.1 engine, noticeably longer build)'
         required: false
-        default: 'false'
+        default: 'true'
         type: string
       build_vision:
         description: 'Also build strata-vision (image encoder). Needs a one-off download of the pinned llama.cpp for mtmd; the artifact itself stays offline.'
         required: false
-        default: 'false'
+        default: 'true'
         type: string
       with_python_wheels:
         description: 'Also build the offline Python wheelhouse artifact'
@@ -58,13 +62,29 @@ on:
         required: false
         default: '4'
         type: string
+      release_tag:
+        description: 'Also publish both tar.gz artifacts to this GitHub Release tag (empty: artifacts only). Uses GITHUB_TOKEN, so no other workflow is started.'
+        required: false
+        default: ''
+        type: string
+      release_draft:
+        description: 'Create the release as a draft (a draft emits no published event)'
+        required: false
+        default: 'true'
+        type: string
+      allow_replace:
+        description: 'Allow re-uploading assets when the tag already has a release (same-tag rebuild)'
+        required: false
+        default: 'false'
+        type: string
   workflow_call:
 
 permissions:
   contents: read
 
 concurrency:
-  group: strata-el8-aarch64-${{ github.ref }}
+  # Two releases with different tags must not cancel each other.
+  group: strata-el8-aarch64-${{ github.ref }}-${{ inputs.release_tag || 'adhoc' }}
   cancel-in-progress: true
 
 env:
@@ -94,8 +114,8 @@ jobs:
     env:
       ARM64_ARCH: ${{ inputs.arm64_arch || 'armv8-a' }}
       CUDA_ARCHS: ${{ inputs.cuda_archs || '120-real' }}
-      BUILD_DSV41: ${{ inputs.build_dsv41 || 'false' }}
-      BUILD_VISION: ${{ inputs.build_vision || 'false' }}
+      BUILD_DSV41: ${{ inputs.build_dsv41 || 'true' }}
+      BUILD_VISION: ${{ inputs.build_vision || 'true' }}
       JOBS: ${{ inputs.jobs || '4' }}
     steps:
       - name: System dependencies (EL8 / dnf)
@@ -211,7 +231,7 @@ jobs:
       # the resulting artifact still runs fully offline. Pinned to the same
       # commit setup.py and .github/workflows/backends.yml use.
       - name: llama.cpp at the pinned commit (mtmd for strata-vision)
-        if: ${{ (inputs.build_vision || 'false') == 'true' }}
+        if: ${{ (inputs.build_vision || 'true') == 'true' }}
         run: |
           commit=$(sed -n 's/^LLAMA_CPP_COMMIT = "\(.*\)"/\1/p' setup.py)
           test -n "$commit" || { echo "error: LLAMA_CPP_COMMIT not found in setup.py"; exit 1; }
@@ -226,7 +246,7 @@ jobs:
           echo "llama.cpp at $commit"
 
       - name: Build strata-vision (image encoder)
-        if: ${{ (inputs.build_vision || 'false') == 'true' }}
+        if: ${{ (inputs.build_vision || 'true') == 'true' }}
         run: |
           # The official flags (packaging/build_cuda_linux.sh / spark/build_engine.sh),
           # with our EL8 compiler paths, our conservative aarch64 -march and our
@@ -566,3 +586,75 @@ jobs:
             strata-pydeps-*.tar.gz
             strata-pydeps-*.tar.gz.sha256
           if-no-files-found: error
+
+  # Attach the tar.gz artifacts to a GitHub Release.
+  #
+  # Why this cannot start another workflow:
+  #   * every API call below uses the repository's own GITHUB_TOKEN. GitHub
+  #     deliberately does NOT start a new workflow run for events produced by
+  #     GITHUB_TOKEN (infinite-loop protection), so creating a tag / release or
+  #     uploading assets triggers nothing.
+  #   * no PAT, no GitHub App token, no `git push`, no tag-push event.
+  #   * this workflow has no `push: tags:` trigger, and nothing else in this
+  #     repo listens to `release` (docker-images.yml is manual dispatch with a
+  #     required release_tag).
+  #   * `release_draft` defaults to true; a draft emits no `published` event.
+  #   * gated on workflow_dispatch, so a workflow_call from another workflow
+  #     can never publish by accident.
+  publish:
+    name: publish to release
+    needs: [engine, python-wheels]
+    if: ${{ always() && github.event_name == 'workflow_dispatch' && (inputs.release_tag || '') != '' && needs.engine.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write        # this job only; the build jobs stay read-only
+      actions: read          # download-artifact; job-level permissions reset the rest to none
+    env:
+      TAG: ${{ inputs.release_tag }}
+      DRAFT: ${{ inputs.release_draft }}
+      ALLOW_REPLACE: ${{ inputs.allow_replace }}
+    steps:
+      - name: Download the tar.gz artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: strata-*
+          merge-multiple: true
+          path: dist
+
+      - name: Check the artifacts
+        run: |
+          set -eu
+          test -n "$(find dist -name 'strata-engine-*.tar.gz' -print -quit)" || {
+            echo "error: no engine tar.gz was downloaded"; exit 1; }
+          cd dist
+          ls -lh
+          for f in *.sha256; do
+            [ -f "$f" ] || continue
+            sha256sum -c "$f"
+          done
+
+      - name: Create or update the release (GITHUB_TOKEN)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          cd dist
+          notes="Built from ${GITHUB_SHA:0:12} by build-cuda-el8-aarch64.yml. The engine tar.gz is self-contained (only the NVIDIA driver is needed on the host); the pydeps tar.gz is the offline Python wheelhouse. See DEPLOY.txt inside the engine package."
+          # A preflight, never a silent overwrite: re-publishing the same tag
+          # is an explicit opt-in (allow_replace), not a surprise.
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            if [ "$ALLOW_REPLACE" != true ]; then
+              echo "error: release $TAG already exists. Use a new tag, or set allow_replace=true to re-upload its assets in place." >&2
+              exit 1
+            fi
+            echo "re-uploading assets to the existing release $TAG"
+            gh release upload "$TAG" ./*.tar.gz ./*.tar.gz.sha256 --clobber
+          else
+            create_args=(--target "$GITHUB_SHA" \
+              --title "Strata engine / EL8 aarch64 CUDA13 NVFP4 ($TAG)" \
+              --notes "$notes")
+            if [ "$DRAFT" = true ]; then create_args+=(--draft); fi
+            gh release create "$TAG" ./*.tar.gz ./*.tar.gz.sha256 "${create_args[@]}"
+          fi
+          gh release view "$TAG" --json tagName,isDraft,assets \
+            --jq '{tag: .tagName, draft: .isDraft, assets: [.assets[].name]}'
