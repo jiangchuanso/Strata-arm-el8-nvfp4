@@ -1,0 +1,568 @@
+name: Build Strata engine (EL8 / aarch64 / CUDA 13 / NVFP4)
+
+# Fork-only workflow. Nothing here exists upstream, so it never conflicts when
+# merging Niko1221/Strata. It follows the shape of jiangchuanso/llama.cpp-zh-el8's
+# build-cuda-el8.yml: a native aarch64 GitHub runner with an almalinux:8
+# container, NVIDIA's official EL8-compatible CUDA runfile, and a package that
+# carries its own CUDA/C++ runtimes so the target host needs only the driver.
+#
+# Target (offline production box):
+#   2U Phytium S5000C (aarch64) / 128 GB DDR5 / RTX Pro 4000 24 GB (cc 12.0,
+#   Blackwell) / 4 TB x3 RAID5 / CentOS 8 or UOS V20 1070 (glibc 2.28) /
+#   ONLY the official stable NVIDIA driver installed (no CUDA Toolkit, no nvcc,
+#   no pip access). The driver supplies libcuda.so.1 and nothing else.
+#   NVFP4 models come from HuggingFace as ready-made GGUF; no local ModelOpt
+#   conversion (tools/nvfp4_local_pack.py / torch) is needed on this box.
+#
+# Deliverables (both are tar.gz artifacts, no RPM):
+#   1. strata-engine-<ver>-el8-aarch64-cuda13-nvfp4.tar.gz
+#      The C++ engine in Strata's own engine-component layout: strata,
+#      libstrata_kq.so, optionally strata-dsv41 and strata-vision, the CUDA
+#      runtime libraries, EL8's libstdc++/libgomp, BUILD.json,
+#      SYSTEM-LIBS.txt, engine-component.json, DEPLOY.txt and the two check
+#      scripts. Unpack it and it is usable with the Python CLI layer.
+#   2. strata-pydeps-<ver>-py311-aarch64-el8.tar.gz (optional, separate job)
+#      An offline wheelhouse for the Python CLI/API-server dependencies. It is
+#      NOT part of the engine package; see DEPLOY.txt for why it exists.
+
+on:
+  workflow_dispatch:
+    inputs:
+      arm64_arch:
+        description: 'ggml-cpu -march. Default armv8-a is safe on every ARMv8 CPU (Phytium S5000C is ARMv8.2 but dotprod/i8mm are optional). Raise it only after running probe-cpu.sh on the target box.'
+        required: false
+        default: 'armv8-a'
+        type: string
+      cuda_archs:
+        description: 'CMAKE_CUDA_ARCHITECTURES. 120-real = RTX Pro 4000 / RTX 50 cubin; CMake rewrites the NVFP4 W4A4 unit to 120a-real for Blackwell FP4 MMA.'
+        required: false
+        default: '120-real'
+        type: string
+      build_dsv41:
+        description: 'Also build strata-dsv41 (DeepSeek-V4.1 engine, noticeably longer build)'
+        required: false
+        default: 'false'
+        type: string
+      build_vision:
+        description: 'Also build strata-vision (image encoder). Needs a one-off download of the pinned llama.cpp for mtmd; the artifact itself stays offline.'
+        required: false
+        default: 'false'
+        type: string
+      with_python_wheels:
+        description: 'Also build the offline Python wheelhouse artifact'
+        required: false
+        default: 'true'
+        type: string
+      jobs:
+        description: 'Parallel compile jobs (the free arm64 runner has 4 vCPU / 16 GB; lower this on OOM)'
+        required: false
+        default: '4'
+        type: string
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: strata-el8-aarch64-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # CUDA 13 is mandatory for sm_120 (CUDA 12.8 builds crashed on long prompts,
+  # #220/#224), and 13.0.0 has the lowest driver floor of the 13.x line
+  # (>= 580). The runfile name embeds the driver it bundles, so these two must
+  # stay in sync with NVIDIA's archive or the download 404s.
+  CUDA_VERSION: '13.0.0'
+  CUDA_RUN_DRIVER: '580.65.06'
+  # The aarch64 (server / SBSA) runfile, not the x86_64 one.
+  CUDA_RUNFILE_FLAVOR: 'linux_sbsa'
+  # EL8 ships cmake 3.20, Strata needs >= 3.24, and parsing CUDA 13 + the
+  # arch-specific 120a target wants a recent CMake. Kitware publishes native
+  # linux-aarch64 tarballs from 3.28 on.
+  CMAKE_VERSION: '3.31.6'
+  GLIBC_MAX: '2.28'
+  PYTHON: 'python3.11'
+  MIN_DRIVER: '580.65'
+
+jobs:
+  engine:
+    name: engine / el8-aarch64-cuda13-nvfp4
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 360
+    container:
+      image: almalinux:8
+    env:
+      ARM64_ARCH: ${{ inputs.arm64_arch || 'armv8-a' }}
+      CUDA_ARCHS: ${{ inputs.cuda_archs || '120-real' }}
+      BUILD_DSV41: ${{ inputs.build_dsv41 || 'false' }}
+      BUILD_VISION: ${{ inputs.build_vision || 'false' }}
+      JOBS: ${{ inputs.jobs || '4' }}
+    steps:
+      - name: System dependencies (EL8 / dnf)
+        run: |
+          # git is needed by actions/checkout (without it the action falls back
+          # to a REST tarball, which has no .git dir for build ids).
+          dnf -y install --setopt=install_weak_deps=False \
+            git ca-certificates wget perl tar which make binutils \
+            gcc-toolset-14 \
+            python3.11 python3.11-pip
+          echo "PATH=/opt/rh/gcc-toolset-14/root/usr/bin:$PATH" >> "$GITHUB_ENV"
+          echo "CC=gcc" >> "$GITHUB_ENV"
+          echo "CXX=g++" >> "$GITHUB_ENV"
+          test -x /opt/rh/gcc-toolset-14/root/usr/bin/gcc
+          /opt/rh/gcc-toolset-14/root/usr/bin/gcc --version | head -1
+          /usr/bin/python3.11 --version
+
+      - name: CMake (Kitware aarch64 binary)
+        run: |
+          name="cmake-${CMAKE_VERSION}-linux-aarch64"
+          url="https://github.com/Kitware/CMake/releases/download/v${CMAKE_VERSION}/${name}.tar.gz"
+          if ! wget -q "$url" -O /tmp/cmake.tar.gz; then
+            echo "error: cannot download $url - check CMAKE_VERSION (needs a release with a linux-aarch64 tarball)"
+            exit 1
+          fi
+          mkdir -p /opt/cmake
+          tar -xzf /tmp/cmake.tar.gz -C /opt/cmake --strip-components=1
+          rm -f /tmp/cmake.tar.gz
+          echo "/opt/cmake/bin" >> "$GITHUB_PATH"
+          /opt/cmake/bin/cmake --version | head -1
+
+      - name: Clone
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: CUDA Toolkit (official EL8-compatible SBSA runfile)
+        run: |
+          runfile="cuda_${CUDA_VERSION}_${CUDA_RUN_DRIVER}_${CUDA_RUNFILE_FLAVOR}.run"
+          url="https://developer.download.nvidia.com/compute/cuda/${CUDA_VERSION}/local_installers/${runfile}"
+          if ! wget -q "$url" -O "$runfile"; then
+            echo "error: cannot download $runfile - CUDA_VERSION / CUDA_RUN_DRIVER must match NVIDIA's archive"
+            exit 1
+          fi
+          uname -m
+          sh "$runfile" --toolkit --silent --override \
+            --installpath="/usr/local/cuda-${CUDA_VERSION%.*}"
+          rm -f "$runfile"
+          CUDA_HOME="/usr/local/cuda-${CUDA_VERSION%.*}"
+          echo "CUDA_HOME=$CUDA_HOME" >> "$GITHUB_ENV"
+          echo "$CUDA_HOME/bin" >> "$GITHUB_PATH"
+          "$CUDA_HOME/bin/nvcc" --version
+
+      # Strata vendors a trimmed ggml in third_party/strata-ggml. Leaving
+      # STRATA_GGML_DIR unset uses it, so the ENGINE needs NO llama.cpp download
+      # (setup.py's get_llama_cpp / the CI backends.yml fetch are never called).
+      # That same tree carries the trellis MMQ instances, so it is the more
+      # complete source anyway. Only strata-vision needs the full llama.cpp
+      # (mtmd), and that is opt-in below.
+      - name: Configure
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          want_dsv41=OFF
+          if [ "$BUILD_DSV41" = true ]; then want_dsv41=ON; fi
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=/opt/rh/gcc-toolset-14/root/usr/bin/gcc \
+            -DCMAKE_CXX_COMPILER=/opt/rh/gcc-toolset-14/root/usr/bin/g++ \
+            -DCMAKE_CUDA_HOST_COMPILER=/opt/rh/gcc-toolset-14/root/usr/bin/g++ \
+            -DCMAKE_CUDA_COMPILER="$CUDA_HOME/bin/nvcc" \
+            -DCUDAToolkit_ROOT="$CUDA_HOME" \
+            -DSTRATA_ENABLE_CUDA=ON \
+            -DSTRATA_BUILD_TESTS=OFF \
+            -DSTRATA_NATIVE_EXPERTS=ON \
+            -DSTRATA_PORTABLE=ON \
+            -DSTRATA_Q6K_EXPERTS=ON \
+            -DSTRATA_MMQ_KQUANTS=ON \
+            -DSTRATA_BUILD_DSV41="$want_dsv41" \
+            -DGGML_CPU_KLEIDIAI=OFF \
+            -DSTRATA_ARM64_ARCH="$ARM64_ARCH" \
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+            '-DCMAKE_INSTALL_RPATH=$ORIGIN' \
+            -DCMAKE_SHARED_LINKER_FLAGS=-Wl,--disable-new-dtags \
+            -DCMAKE_EXE_LINKER_FLAGS=-Wl,--disable-new-dtags \
+            "-DCMAKE_CUDA_ARCHITECTURES=$CUDA_ARCHS"
+          # The W4A4 NVFP4 unit is rewritten from 120-real to 120a-real by
+          # cmake/backends/cuda.cmake; everything else stays a plain sm_120
+          # cubin. No PTX: an offline box should not have to JIT.
+
+      - name: Build
+        run: |
+          targets="strata strata_kq"
+          if [ "$BUILD_DSV41" = true ]; then targets="$targets strata-dsv41"; fi
+          time cmake --build build --target $targets -j "$JOBS"
+          ls -lh build/strata
+          if [ -f build/libstrata_kq.so ]; then ls -lh build/libstrata_kq.so; fi
+          if [ -f build/strata-dsv41 ]; then ls -lh build/strata-dsv41; fi
+
+      - name: Check the NVFP4 W4A4 cubin is present
+        run: |
+          # w4a4 (Blackwell FP4 MMA) only compiles into an arch-specific
+          # sm_120a image. Without it the engine silently falls back to w4a8,
+          # which is correct but not what this package is for.
+          want=$(printf '%s' "$CUDA_ARCHS" | grep -oE '^[0-9]+' | head -1)
+          test -n "$want" || { echo "error: CUDA_ARCHS has no numeric arch: $CUDA_ARCHS"; exit 1; }
+          "$CUDA_HOME/bin/cuobjdump" --list-elf build/strata | tee /tmp/elfs.txt
+          grep -q "sm_${want}" /tmp/elfs.txt || { echo "error: no sm_${want} cubin in the engine"; exit 1; }
+          grep -q "sm_${want}a" /tmp/elfs.txt || { echo "error: no sm_${want}a cubin - the NVFP4 W4A4 unit was not built. Check CMAKE_CUDA_ARCHITECTURES."; exit 1; }
+
+      # strata-vision links llama.cpp's mtmd, which the vendored trimmed ggml
+      # does not carry. This is the only step that reaches out to the network;
+      # the resulting artifact still runs fully offline. Pinned to the same
+      # commit setup.py and .github/workflows/backends.yml use.
+      - name: llama.cpp at the pinned commit (mtmd for strata-vision)
+        if: ${{ (inputs.build_vision || 'false') == 'true' }}
+        run: |
+          commit=$(sed -n 's/^LLAMA_CPP_COMMIT = "\(.*\)"/\1/p' setup.py)
+          test -n "$commit" || { echo "error: LLAMA_CPP_COMMIT not found in setup.py"; exit 1; }
+          mkdir -p third_party/llama.cpp
+          cd third_party/llama.cpp
+          git init -q
+          git remote add origin https://github.com/ggml-org/llama.cpp.git
+          git fetch -q --depth 1 origin "$commit"
+          git checkout -q FETCH_HEAD
+          test -f CMakeLists.txt
+          test -f ggml/CMakeLists.txt
+          echo "llama.cpp at $commit"
+
+      - name: Build strata-vision (image encoder)
+        if: ${{ (inputs.build_vision || 'false') == 'true' }}
+        run: |
+          # The official flags (packaging/build_cuda_linux.sh / spark/build_engine.sh),
+          # with our EL8 compiler paths, our conservative aarch64 -march and our
+          # CUDA archs. tools/vision sets its own $ORIGIN rpath on Linux.
+          cmake -S tools/vision -B build-vision \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=/opt/rh/gcc-toolset-14/root/usr/bin/gcc \
+            -DCMAKE_CXX_COMPILER=/opt/rh/gcc-toolset-14/root/usr/bin/g++ \
+            -DCMAKE_CUDA_HOST_COMPILER=/opt/rh/gcc-toolset-14/root/usr/bin/g++ \
+            -DCMAKE_CUDA_COMPILER="$CUDA_HOME/bin/nvcc" \
+            -DCUDAToolkit_ROOT="$CUDA_HOME" \
+            -DLLAMA_DIR="$GITHUB_WORKSPACE/third_party/llama.cpp" \
+            -DSTRATA_VISION_CUDA=ON -DSTRATA_PORTABLE=ON \
+            -DGGML_CUDA_NCCL=OFF -DGGML_CPU_KLEIDIAI=OFF \
+            -DGGML_CPU_ARM_ARCH="$ARM64_ARCH" \
+            "-DCMAKE_CUDA_ARCHITECTURES=$CUDA_ARCHS"
+          cmake --build build-vision --target strata-vision -j "$JOBS"
+          ls -lh build-vision/bin/strata-vision
+
+      - name: Stage engine and its runtimes
+        run: |
+          mkdir -p stage/engine
+          cp -a build/strata stage/engine/
+          if [ -f build/libstrata_kq.so ]; then cp -a build/libstrata_kq.so stage/engine/; fi
+          if [ -f build/strata-dsv41 ]; then cp -a build/strata-dsv41 stage/engine/; fi
+          if [ -f build-vision/bin/strata-vision ]; then cp -a build-vision/bin/strata-vision stage/engine/; fi
+
+          # One numeric arch list drives the manifest's --arch, BUILD.json's
+          # archs and the reader's vision_archs, so changing cuda_archs cannot
+          # leave the three disagreeing. "120-real" -> "120".
+          arch_numbers=""
+          for a in $(echo "$CUDA_ARCHS" | tr ';,' '  '); do
+            n=$(printf '%s' "$a" | grep -oE '^[0-9]+' || true)
+            [ -n "$n" ] || continue
+            if [ -z "$arch_numbers" ]; then arch_numbers="$n"; else arch_numbers="$arch_numbers;$n"; fi
+          done
+          test -n "$arch_numbers" || { echo "error: CUDA_ARCHS has no numeric arch: $CUDA_ARCHS"; exit 1; }
+          echo "ARCH_NUMBERS=$arch_numbers" >> "$GITHUB_ENV"
+          vision_json=""
+          if [ -f stage/engine/strata-vision ]; then
+            vision_json=", \"vision_archs\": \"$arch_numbers\""
+          fi
+
+          # collect_libs.py walks ldd's closure and copies everything the
+          # distribution does not own (the CUDA libraries) under its soname.
+          # libcuda.so.1 is a driver library and is deliberately never copied.
+          "$PYTHON" packaging/collect_libs.py \
+            --binary build/strata --search "$CUDA_HOME/lib64" \
+            --out stage/engine --also 'libcublasLt.so*'
+          # libstrata_kq.so is dlopen'd, so its imports are not in strata's
+          # closure. Same --out: collect_libs.py de-duplicates by soname.
+          if [ -f build/libstrata_kq.so ]; then
+            "$PYTHON" packaging/collect_libs.py \
+              --binary build/libstrata_kq.so --search "$CUDA_HOME/lib64" \
+              --out stage/engine
+          fi
+          # The reader is a separate program with its own ldd closure (ggml-cuda
+          # and mtmd), so it gets the same treatment. package_engine.py's
+          # binary_deps check would refuse an unmet import anyway; collecting
+          # here means that never happens.
+          if [ -f stage/engine/strata-vision ]; then
+            "$PYTHON" packaging/collect_libs.py \
+              --binary stage/engine/strata-vision --search "$CUDA_HOME/lib64" \
+              --out stage/engine --also 'libcublasLt.so*'
+          fi
+
+          # gcc-toolset-14 has no loadable libstdc++.so.6, so the binaries
+          # resolve EL8's copy. UOS V20 1070 / Kylin V10 can have an OLDER
+          # libstdc++ (GCC 7.3 -> GLIBCXX_3.4.24), so ship EL8's own instead of
+          # trusting the host. $ORIGIN makes the engine pick these up first.
+          # If collect_libs.py already brought a toolset copy, keep that one.
+          if [ ! -e stage/engine/libstdc++.so.6 ]; then cp -aL /usr/lib64/libstdc++.so.6* stage/engine/; fi
+          if [ ! -e stage/engine/libgomp.so.1 ]; then cp -aL /usr/lib64/libgomp.so.1* stage/engine/; fi
+
+          ver=$(sed -n 's/^project(strata VERSION \([0-9][0-9.]*\).*/\1/p' CMakeLists.txt | head -1)
+          cudafull=$("$CUDA_HOME/bin/nvcc" --version | sed -n 's/.*release \([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' | head -1)
+          commit=$(git rev-parse HEAD)
+          echo "STRATA_VERSION=$ver" >> "$GITHUB_ENV"
+          echo "CUDA_FULL=$cudafull" >> "$GITHUB_ENV"
+          cat > stage/engine/BUILD.json <<EOF
+          {
+            "version": "$ver",
+            "source": "GitHub Actions / build-cuda-el8-aarch64.yml",
+            "platform": "linux-aarch64",
+            "backend": "cuda",
+            "variant": "cuda13",
+            "archs": "$arch_numbers",
+            "cuda": "$cudafull",
+            "cuda_architectures": "$CUDA_ARCHS",
+            "nvfp4": "w4a8 (default) + w4a4 (sm_120a)",
+            "portable": true,
+            "arm64_arch": "$ARM64_ARCH",
+            "glibc_max": "$GLIBC_MAX",
+            "min_driver": "$MIN_DRIVER",
+            "ptx": false,
+            "commit": "$commit"$vision_json
+          }
+          EOF
+          "$PYTHON" -m json.tool stage/engine/BUILD.json >/dev/null
+
+          cat > stage/engine/DEPLOY.txt <<'EOF'
+          Strata engine - EL8 / aarch64 / CUDA 13 / NVFP4
+          ===============================================
+
+          Engine only. This package is a Strata "engine component": the CLI /
+          Control layer scans <components>/engine/ for it and verifies
+          engine-component.json before starting anything. It is NOT a
+          standalone service (the API server is Python) and it is NOT signed,
+          so leave STRATA_REQUIRE_SIGNED_COMPONENTS unset on this host.
+
+          TARGET PREREQUISITES
+            * aarch64 Linux, glibc >= 2.28 (CentOS 8 / UOS V20 1070 / Kylin V10)
+            * NVIDIA driver >= 580.65, official .run installer, stable branch.
+              It provides libcuda.so.1. Do NOT install a CUDA Toolkit and do
+              NOT put libcuda.so.1 in this directory.
+            * Python 3.10+ for the CLI/API-server layer (UOS/CentOS 8 ship 3.6,
+              which is too old - install a newer interpreter separately).
+            * for `strata serve` / `strata bench`, the packages in
+              requirements.txt (jinja2, pyyaml, regex, psutil, requests, numpy,
+              pillow and their dependencies). On an offline box use the separate
+              strata-pydeps-*.tar.gz wheelhouse and its install-python-deps.sh.
+              `strata --help`, `status`, `monitor` are stdlib-only.
+
+          INSTALL
+            # <components> is ~/.local/share/strata/components by default,
+            # or set STRATA_COMPONENTS_DIR for a system-wide location.
+            COMPONENTS=${STRATA_COMPONENTS_DIR:-$HOME/.local/share/strata/components}
+            mkdir -p "$COMPONENTS/engine"
+            tar -xzf strata-engine-*.tar.gz -C "$COMPONENTS/engine"
+            cd "$COMPONENTS/engine"/<version>-linux-aarch64-cuda-cuda13
+            # keep every file together: engine-component.json hashes them all
+            ./verify-engine.sh .        # needs binutils (readelf/objdump)
+            ./probe-cpu.sh              # best -march for a possible rebuild
+            strata status               # from the Python CLI layer
+
+          WHY IT RUNS WITHOUT A TOOLKIT
+            libcudart / libcublas / libcublasLt and EL8's libstdc++ / libgomp
+            travel in this directory. Every ELF has an $ORIGIN rpath, so the
+            loader resolves them next to the executable, never from /usr/lib64
+            and never from a toolkit. libcuda.so.1 is the only GPU library left
+            to the host driver. No LD_LIBRARY_PATH, no ld.so.conf changes.
+
+          PICTURES
+            If this folder contains `strata-vision`, image input is available
+            and BUILD.json records vision_archs for the same sm_120 target.
+            Without it Strata runs text-only: setup.py prints "images off for
+            this model". That is an official, supported package shape
+            (BUILD_VISION=0), not a broken install.
+
+          GPU / NVFP4
+            Built for sm_120 (RTX Pro 4000 Blackwell, RTX 50). No PTX: an older
+            card has no cubin to load and the engine will not offload to it.
+            STRATA_PREFILL_NVFP4 selects the prompt path's expert precision:
+            w4a8 (default, int8 tensor cores), w4a4 (Blackwell FP4 MMA, only
+            on sm_120a), w4a4x2 or fp16. See docs/NVFP4.md.
+            NVFP4 weights come from HuggingFace as ready-made GGUF; put them on
+            the RAID5 array. No local ModelOpt conversion is needed here.
+
+          CHECK
+            nvidia-smi                              # driver loaded, >= 580.65
+            ./strata --version
+            LD_DEBUG=libs ./strata --version 2>&1 | grep -E 'libcuda|libcublas'
+          EOF
+
+          cp -a packaging/el8/verify-engine.sh packaging/el8/probe-cpu.sh stage/engine/
+          chmod 0755 stage/engine/verify-engine.sh stage/engine/probe-cpu.sh
+          echo "== staged =="
+          ls -lh stage/engine
+          du -sh stage/engine
+
+      - name: Package (engine-component.json, hash manifest)
+        run: |
+          mkdir -p stage/components
+          arch_args=""
+          for n in $(echo "$ARCH_NUMBERS" | tr ';' ' '); do arch_args="$arch_args --arch sm_$n"; done
+          dsv41_arg=""
+          if [ "$BUILD_DSV41" = true ]; then dsv41_arg=--require-dsv41; fi
+          "$PYTHON" packaging/package_engine.py \
+            --src stage/engine --backend cuda --platform linux-aarch64 \
+            --version "$STRATA_VERSION" --out stage/components \
+            --variant cuda13 $arch_args \
+            --min-driver "nvidia=$MIN_DRIVER" \
+            --build-id "el8-cuda${CUDA_FULL}-$(git rev-parse --short=12 HEAD)" \
+            --include SYSTEM-LIBS.txt --include 'libstrata_kq*' \
+            --include DEPLOY.txt --include verify-engine.sh --include probe-cpu.sh \
+            $dsv41_arg
+          pkg=$(find stage/components -mindepth 1 -maxdepth 1 -type d -print -quit)
+          test -n "$pkg"
+          echo "STRATA_PKG=$pkg" >> "$GITHUB_ENV"
+
+      - name: Verify the package
+        run: |
+          "$PYTHON" packaging/package_engine.py --verify "$STRATA_PKG"
+          "$PYTHON" packaging/binary_deps.py "$STRATA_PKG"
+          packaging/el8/verify-engine.sh "$STRATA_PKG" "$GLIBC_MAX"
+          echo "== dynamic section of the engine =="
+          readelf -d "$STRATA_PKG/strata" | grep -E 'NEEDED|RPATH|RUNPATH'
+          echo "== what the host must still provide =="
+          cat "$STRATA_PKG/SYSTEM-LIBS.txt"
+
+      # Static checks above cannot catch a loader failure. The container has no
+      # NVIDIA driver, so point the loader at CUDA's link stub (it exports the
+      # driver API without a GPU): ldd -r can then resolve every relocation and
+      # --version can actually start. A missing .so is a hard failure; a
+      # --version failure is a warning, because the stub is not a real driver.
+      - name: Smoke - resolve libraries and run --version
+        run: |
+          stub=$(mktemp -d)
+          if [ -f "$CUDA_HOME/lib64/stubs/libcuda.so" ]; then
+            ln -s "$CUDA_HOME/lib64/stubs/libcuda.so" "$stub/libcuda.so.1"
+          fi
+          export LD_LIBRARY_PATH="$stub:$STRATA_PKG"
+          for exe in strata strata-dsv41 strata-vision; do
+            [ -f "$STRATA_PKG/$exe" ] || continue
+            echo "== ldd -r $exe =="
+            ldd -r "$STRATA_PKG/$exe" | tee /tmp/ldd-exe.txt
+            bad=$(grep 'not found' /tmp/ldd-exe.txt | grep -vE 'libcuda|libnvidia' || true)
+            if [ -n "$bad" ]; then
+              echo "error: $exe has libraries the loader cannot resolve:" >&2
+              echo "$bad" >&2
+              exit 1
+            fi
+          done
+          echo "== --version =="
+          for exe in strata strata-dsv41; do
+            [ -f "$STRATA_PKG/$exe" ] || continue
+            if "$STRATA_PKG/$exe" --version; then
+              echo "$exe --version: ok"
+            else
+              echo "::warning::$exe --version failed in this container (the CUDA stub is not a real NVIDIA driver); the target host has one. Read the output above."
+            fi
+          done
+
+      - name: Make the tar.gz artifact
+        run: |
+          name="strata-engine-${STRATA_VERSION}-el8-aarch64-cuda13-nvfp4.tar.gz"
+          tar -czf "$name" -C stage/components "$(basename "$STRATA_PKG")"
+          sha256sum "$name" | tee "$name.sha256"
+          ls -lh "$name"
+          tar -tzf "$name" > /tmp/strata-package-list.txt
+          vision_note="no (text-only)"
+          if [ -f "$STRATA_PKG/strata-vision" ]; then vision_note="yes"; fi
+          dsv41_note="no"
+          if [ -f "$STRATA_PKG/strata-dsv41" ]; then dsv41_note="yes"; fi
+          {
+            echo "### Engine package"
+            echo ""
+            echo '```'
+            head -40 /tmp/strata-package-list.txt
+            echo '```'
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| glibc baseline | $GLIBC_MAX |"
+            echo "| CUDA | $CUDA_VERSION (toolkit only, not needed on the host) |"
+            echo "| GPU arch | $CUDA_ARCHS (w4a4 unit rebuilt as 120a-real) |"
+            echo "| arm64 -march | $ARM64_ARCH |"
+            echo "| min driver | $MIN_DRIVER |"
+            echo "| strata-vision | $vision_note |"
+            echo "| strata-dsv41 | $dsv41_note |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload engine tar.gz
+        uses: actions/upload-artifact@v4
+        with:
+          name: strata-engine-el8-aarch64-cuda13-nvfp4
+          path: |
+            strata-engine-*.tar.gz
+            strata-engine-*.tar.gz.sha256
+          if-no-files-found: error
+
+  # The engine has zero Python dependencies. The Python CLI/API-server layer
+  # does, and an offline production box cannot reach PyPI. This job builds a
+  # wheelhouse in the SAME glibc 2.28 aarch64 environment, so pip only selects
+  # manylinux tags the target can actually load. It is a separate artifact:
+  # the engine tar.gz stays a pure C++ package. requirements-nvfp4-local.txt
+  # (torch / transformers / safetensors) is deliberately NOT here: the NVFP4
+  # GGUF comes from HuggingFace ready-made, so no local conversion is needed.
+  python-wheels:
+    name: offline Python wheelhouse
+    if: ${{ (inputs.with_python_wheels || 'true') != 'false' }}
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    continue-on-error: true
+    container:
+      image: almalinux:8
+    steps:
+      - name: System dependencies (EL8 / dnf)
+        run: |
+          dnf -y install --setopt=install_weak_deps=False \
+            git ca-certificates tar python3.11 python3.11-pip
+          python3.11 -m pip install --upgrade pip setuptools
+          python3.11 -m pip --version
+
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Download aarch64 / glibc 2.28 wheels
+        run: |
+          mkdir -p stage/pydeps
+          # No --platform override: running natively on aarch64 with EL8's
+          # Python 3.11 makes pip pick aarch64 + compatible manylinux tags by
+          # itself, including the pure-python any wheels.
+          python3.11 -m pip download \
+            -r requirements.txt -d stage/pydeps/wheels \
+            --only-binary=:all:
+          cp requirements.txt stage/pydeps/
+          cat > stage/pydeps/install-python-deps.sh <<'EOF'
+          #!/bin/sh
+          # Offline install of Strata's Python CLI/API-server dependencies.
+          #   STRATA_PYTHON=/path/to/python3.11 ./install-python-deps.sh
+          # Nothing is downloaded; wheels/ is the only source.
+          set -eu
+          HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+          PY=${STRATA_PYTHON:-python3.11}
+          "$PY" -m pip install --no-index --find-links "$HERE/wheels" \
+            -r "$HERE/requirements.txt"
+          EOF
+          chmod 0755 stage/pydeps/install-python-deps.sh
+          echo "== wheels =="
+          ls stage/pydeps/wheels | head -40
+
+      - name: Make the tar.gz artifact
+        run: |
+          ver=$(sed -n 's/^project(strata VERSION \([0-9][0-9.]*\).*/\1/p' CMakeLists.txt | head -1)
+          name="strata-pydeps-${ver}-py311-aarch64-el8.tar.gz"
+          tar -czf "$name" -C stage pydeps
+          sha256sum "$name" | tee "$name.sha256"
+          ls -lh "$name"
+
+      - name: Upload wheelhouse tar.gz
+        uses: actions/upload-artifact@v4
+        with:
+          name: strata-pydeps-py311-aarch64-el8
+          path: |
+            strata-pydeps-*.tar.gz
+            strata-pydeps-*.tar.gz.sha256
+          if-no-files-found: error
