@@ -108,11 +108,11 @@ done
 [ -f "$pkg/BUILD.json" ] || err "BUILD.json is missing"
 [ -f "$pkg/engine-component.json" ] || err "engine-component.json is missing"
 
-echo "== $ORIGIN rpath on the programs =="
+echo '== $ORIGIN rpath on the programs =='
 for f in "$pkg"/strata "$pkg"/strata-dsv41 "$pkg"/libstrata_kq.so "$pkg"/strata-vision; do
     [ -f "$f" ] || continue
     if readelf -d "$f" | grep -E 'RPATH|RUNPATH' | grep -qF '$ORIGIN'; then
-        echo "  ${f##*/}: $ORIGIN"
+        echo "  ${f##*/}: \$ORIGIN"
     else
         err "${f##*/} has no \$ORIGIN rpath; it would load the host's libraries instead of this package's"
     fi
