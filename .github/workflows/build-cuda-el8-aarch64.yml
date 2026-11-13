@@ -643,9 +643,17 @@ jobs:
       - name: Create or update the release (GITHUB_TOKEN)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # This job never checks out the repository. Without GH_REPO, gh shells
+          # out to git to infer the repository and dies with "not a git
+          # repository" (see the v0.1.59.1-el8a run on 2026-11-13).
+          GH_REPO: ${{ github.repository }}
         run: |
           set -eu
           cd dist
+          # A config assertion, not a silent preflight: prove the token and the
+          # repository are usable. Otherwise an auth/repo error is mistaken for
+          # "release not found" below and falls through to `gh release create`.
+          gh repo view --json nameWithOwner >/dev/null
           notes="Built from ${GITHUB_SHA:0:12} by build-cuda-el8-aarch64.yml. The engine tar.gz is self-contained (only the NVIDIA driver is needed on the host); the pydeps tar.gz is the offline Python wheelhouse. See DEPLOY.txt inside the engine package."
           # A preflight, never a silent overwrite: re-publishing the same tag
           # is an explicit opt-in (allow_replace), not a surprise.
