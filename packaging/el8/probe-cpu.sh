@@ -2,10 +2,12 @@
 # probe-cpu.sh - run this ON THE TARGET BOX before rebuilding the engine.
 #
 # Strata's portable aarch64 build compiles ggml-cpu with one -march
-# (STRATA_ARM64_ARCH). The workflow defaults to armv8-a because it starts on
-# every ARMv8 CPU: dotprod and i8mm are optional extensions (Armv8.4 / 8.6),
-# and a Phytium FTC860 core (ARMv8.2) is not guaranteed to have them. Building
-# with an extension the CPU lacks gives an immediate SIGILL. This script reads
+# (STRATA_ARM64_ARCH). build-cuda-el8-aarch64.yml defaults to
+# armv8.2-a+dotprod+fp16, the highest the EL8 target box (Phytium S5000C)
+# reports: dotprod and FP16 are in its Features, i8mm and sve are not. i8mm
+# (Armv8.6) and sve are optional, so a value is only safe once this script says
+# the host has it - building with an extension the CPU lacks gives an immediate
+# SIGILL. Use armv8-a for a box without dotprod. This script reads
 # /proc/cpuinfo and prints the highest -march the host can actually run; feed
 # that value into the workflow's `arm64_arch` dispatch input to rebuild.
 set -eu
@@ -50,10 +52,14 @@ if has i8mm && has asimddp && has asimdhp; then
     arch=armv8.2-a+dotprod+fp16+i8mm
 fi
 echo "recommended arm64_arch : $arch"
-echo "workflow default       : armv8-a (always safe, fewer NEON dot-product kernels)"
+echo "workflow default       : armv8.2-a+dotprod+fp16"
 echo ""
-echo "Rebuild with: GitHub Actions -> Build Strata engine (EL8 / aarch64 /"
-echo "CUDA 13 / NVFP4) -> Run workflow -> arm64_arch = $arch"
+if [ "$arch" = "armv8.2-a+dotprod+fp16" ]; then
+    echo "This box matches the workflow default: -march alone needs no rebuild."
+else
+    echo "Rebuild with: GitHub Actions -> Build Strata engine (EL8 / aarch64 /"
+    echo "CUDA 13 / NVFP4) -> Run workflow -> arm64_arch = $arch"
+fi
 echo ""
 echo "GPU / driver (the only GPU prerequisite on this box):"
 if command -v nvidia-smi >/dev/null 2>&1; then

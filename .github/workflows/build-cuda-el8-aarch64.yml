@@ -14,6 +14,13 @@ name: Build Strata engine (EL8 / aarch64 / CUDA 13 / NVFP4)
 #   NVFP4 models come from HuggingFace as ready-made GGUF; no local ModelOpt
 #   conversion (tools/nvfp4_local_pack.py / torch) is needed on this box.
 #
+#   probe-cpu.sh on that box: asimd asimdhp asimddp sha3 sm3 sm4, and NO i8mm /
+#   sve / sve2. So ggml-cpu's -march is armv8.2-a+dotprod+fp16 (the default
+#   below): NEON SDOT/UDOT kernels for the CPU experts and the prompt path,
+#   without an instruction this core lacks. armv8-a stays available for a
+#   CPU without dotprod, and +i8mm only after probe-cpu.sh reports asimd i8mm
+#   (building it for a core that lacks it is an immediate SIGILL).
+#
 # Deliverables (all tar.gz, no RPM):
 #   1. strata-engine-<ver>-el8-aarch64-cuda13-nvfp4.tar.gz
 #      The C++ engine in Strata's own engine-component layout: strata,
@@ -33,9 +40,9 @@ on:
   workflow_dispatch:
     inputs:
       arm64_arch:
-        description: 'ggml-cpu -march. Default armv8-a is safe on every ARMv8 CPU (Phytium S5000C is ARMv8.2 but dotprod/i8mm are optional). Raise it only after running probe-cpu.sh on the target box.'
+        description: 'ggml-cpu -march (STRATA_ARM64_ARCH). Default armv8.2-a+dotprod+fp16: the EL8 target box (Phytium S5000C) reports asimddp + asimdhp. Set armv8-a for a CPU without dotprod, and only add +i8mm / +sve after probe-cpu.sh on that box says so (otherwise SIGILL at the first quantized kernel).'
         required: false
-        default: 'armv8-a'
+        default: 'armv8.2-a+dotprod+fp16'
         type: string
       cuda_archs:
         description: 'CMAKE_CUDA_ARCHITECTURES. 120-real = RTX Pro 4000 / RTX 50 cubin; CMake rewrites the NVFP4 W4A4 unit to 120a-real for Blackwell FP4 MMA.'
@@ -112,7 +119,7 @@ jobs:
     container:
       image: almalinux:8
     env:
-      ARM64_ARCH: ${{ inputs.arm64_arch || 'armv8-a' }}
+      ARM64_ARCH: ${{ inputs.arm64_arch || 'armv8.2-a+dotprod+fp16' }}
       CUDA_ARCHS: ${{ inputs.cuda_archs || '120-real' }}
       BUILD_DSV41: ${{ inputs.build_dsv41 || 'true' }}
       BUILD_VISION: ${{ inputs.build_vision || 'true' }}
