@@ -643,33 +643,41 @@ jobs:
       - name: Create or update the release (GITHUB_TOKEN)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # This job never checks out the repository. Without GH_REPO, gh shells
-          # out to git to infer the repository and dies with "not a git
-          # repository" (see the v0.1.59.1-el8a run on 2026-11-13).
+          # This job never checks out the repository. GH_REPO plus an explicit
+          # --repo on every command keeps gh off its git-based repo lookup.
           GH_REPO: ${{ github.repository }}
         run: |
           set -eu
           cd dist
+          repo="$GITHUB_REPOSITORY"
           # A config assertion, not a silent preflight: prove the token and the
           # repository are usable. Otherwise an auth/repo error is mistaken for
           # "release not found" below and falls through to `gh release create`.
-          gh repo view --json nameWithOwner >/dev/null
+          # Do NOT use `gh repo view` here: even with GH_REPO set it shells out
+          # to git to resolve remotes, which fails outside a checkout with
+          # "fatal: not a git repository" (run 43433580102, 2026-11-13).
+          full_name=$(gh api "repos/$repo" --jq .full_name)
+          test "$full_name" = "$repo" || {
+            echo "error: gh sees '$full_name', expected '$repo'" >&2
+            exit 1
+          }
           notes="Built from ${GITHUB_SHA:0:12} by build-cuda-el8-aarch64.yml. The engine tar.gz is self-contained (only the NVIDIA driver is needed on the host); the pydeps tar.gz is the offline Python wheelhouse. See DEPLOY.txt inside the engine package."
           # A preflight, never a silent overwrite: re-publishing the same tag
           # is an explicit opt-in (allow_replace), not a surprise.
-          if gh release view "$TAG" >/dev/null 2>&1; then
+          if gh release view "$TAG" --repo "$repo" >/dev/null 2>&1; then
             if [ "$ALLOW_REPLACE" != true ]; then
               echo "error: release $TAG already exists. Use a new tag, or set allow_replace=true to re-upload its assets in place." >&2
               exit 1
             fi
             echo "re-uploading assets to the existing release $TAG"
-            gh release upload "$TAG" ./*.tar.gz ./*.tar.gz.sha256 --clobber
+            gh release upload "$TAG" ./*.tar.gz ./*.tar.gz.sha256 --clobber --repo "$repo"
           else
             create_args=(--target "$GITHUB_SHA" \
               --title "Strata engine / EL8 aarch64 CUDA13 NVFP4 ($TAG)" \
-              --notes "$notes")
+              --notes "$notes" \
+              --repo "$repo")
             if [ "$DRAFT" = true ]; then create_args+=(--draft); fi
             gh release create "$TAG" ./*.tar.gz ./*.tar.gz.sha256 "${create_args[@]}"
           fi
-          gh release view "$TAG" --json tagName,isDraft,assets \
+          gh release view "$TAG" --repo "$repo" --json tagName,isDraft,assets \
             --jq '{tag: .tagName, draft: .isDraft, assets: [.assets[].name]}'
