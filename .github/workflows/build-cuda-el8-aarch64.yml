@@ -24,9 +24,12 @@ name: Build Strata engine (EL8 / aarch64 / CUDA 13 / NVFP4)
 # Deliverables (all tar.gz, no RPM):
 #   1. strata-engine-<ver>-el8-aarch64-cuda13-nvfp4.tar.gz
 #      The C++ engine in Strata's own engine-component layout: strata,
-#      libstrata_kq.so, strata-dsv41, strata-vision, the CUDA runtime
-#      libraries, EL8's libstdc++/libgomp, BUILD.json, SYSTEM-LIBS.txt,
-#      engine-component.json, DEPLOY.txt and the two check scripts.
+#      strata-vision (when built), libstrata_kq.so (only in a
+#      -DSTRATA_MMQ=ON build), the CUDA runtime libraries, EL8's
+#      libstdc++/libgomp, BUILD.json, SYSTEM-LIBS.txt, engine-component.json,
+#      DEPLOY.txt and the two check scripts.
+#      There is no strata-dsv41 any more: this tree is 0.2.14, where DeepSeek
+#      V4.1-Flash was retired (strata_control/retired.py) and its engine is gone.
 #   2. strata-terminal-<ver>-linux-aarch64.tar.gz
 #      The self-contained Terminal: a private CPython 3.12.15 plus every locked
 #      runtime wheel (numpy, pillow, jinja2 ... packaging/locks/
@@ -43,9 +46,8 @@ name: Build Strata engine (EL8 / aarch64 / CUDA 13 / NVFP4)
 #      GitHub Release. See the publish job for why this starts no other
 #      workflow.
 #
-# Defaults build the full engine (dsv41 + vision) and the Terminal archive; set
-# build_dsv41 / build_vision / with_terminal / with_python_wheels to 'false' for
-# a faster run.
+# Defaults build the full engine (with vision) and the Terminal archive; set
+# build_vision / with_terminal / with_python_wheels to 'false' for a faster run.
 
 on:
   workflow_dispatch:
@@ -59,11 +61,6 @@ on:
         description: 'CMAKE_CUDA_ARCHITECTURES. 120-real = RTX Pro 4000 / RTX 50 cubin; CMake rewrites the NVFP4 W4A4 unit to 120a-real for Blackwell FP4 MMA.'
         required: false
         default: '120-real'
-        type: string
-      build_dsv41:
-        description: 'Also build strata-dsv41 (DeepSeek-V4.1 engine, noticeably longer build)'
-        required: false
-        default: 'true'
         type: string
       build_vision:
         description: 'Also build strata-vision (image encoder). Needs a one-off download of the pinned llama.cpp for mtmd; the artifact itself stays offline.'
@@ -137,7 +134,6 @@ jobs:
     env:
       ARM64_ARCH: ${{ inputs.arm64_arch || 'armv8.2-a+dotprod+fp16' }}
       CUDA_ARCHS: ${{ inputs.cuda_archs || '120-real' }}
-      BUILD_DSV41: ${{ inputs.build_dsv41 || 'true' }}
       BUILD_VISION: ${{ inputs.build_vision || 'true' }}
       JOBS: ${{ inputs.jobs || '4' }}
     steps:
@@ -202,8 +198,12 @@ jobs:
       - name: Configure
         run: |
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
-          want_dsv41=OFF
-          if [ "$BUILD_DSV41" = true ]; then want_dsv41=ON; fi
+          # -DSTRATA_MMQ=ON: llama.cpp's MMQ prompt kernels, and with them the
+          # Blackwell FP4 MMA unit (strata_mmq_w4a4, the sm_120a image) and
+          # libstrata_kq.so. Upstream defaults this OFF ("Build the engine
+          # without llama.cpp's MMQ kernels by default"); this package is for
+          # NVFP4 on an RTX Pro 4000, so it keeps the path the W4A4 cubin check
+          # and DEPLOY.txt below expect. Nothing else about it changes.
           cmake -S . -B build \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_C_COMPILER=/opt/rh/gcc-toolset-14/root/usr/bin/gcc \
@@ -217,7 +217,7 @@ jobs:
             -DSTRATA_PORTABLE=ON \
             -DSTRATA_Q6K_EXPERTS=ON \
             -DSTRATA_MMQ_KQUANTS=ON \
-            -DSTRATA_BUILD_DSV41="$want_dsv41" \
+            -DSTRATA_MMQ=ON \
             -DGGML_CPU_KLEIDIAI=OFF \
             -DSTRATA_ARM64_ARCH="$ARM64_ARCH" \
             -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
@@ -231,12 +231,18 @@ jobs:
 
       - name: Build
         run: |
-          targets="strata strata_kq"
-          if [ "$BUILD_DSV41" = true ]; then targets="$targets strata-dsv41"; fi
+          # strata_kq (libstrata_kq.so) exists only in a build with llama.cpp's
+          # MMQ, -DSTRATA_MMQ=ON, which is OFF by default since upstream's
+          # "Build the engine without llama.cpp's MMQ kernels by default".
+          # Naming it unconditionally fails with "No rule to make target
+          # 'strata_kq'" (run 43807089380). packaging/engine_targets.sh asks the
+          # configured tree instead, and stops the build if it cannot tell.
+          . packaging/engine_targets.sh
+          targets=$(engine_targets cmake build)
+          echo "targets: $targets"
           time cmake --build build --target $targets -j "$JOBS"
           ls -lh build/strata
           if [ -f build/libstrata_kq.so ]; then ls -lh build/libstrata_kq.so; fi
-          if [ -f build/strata-dsv41 ]; then ls -lh build/strata-dsv41; fi
 
       - name: Check the NVFP4 W4A4 cubin is present
         run: |
@@ -294,7 +300,6 @@ jobs:
           mkdir -p stage/engine
           cp -a build/strata stage/engine/
           if [ -f build/libstrata_kq.so ]; then cp -a build/libstrata_kq.so stage/engine/; fi
-          if [ -f build/strata-dsv41 ]; then cp -a build/strata-dsv41 stage/engine/; fi
           if [ -f build-vision/bin/strata-vision ]; then cp -a build-vision/bin/strata-vision stage/engine/; fi
 
           # One numeric arch list drives the manifest's --arch, BUILD.json's
@@ -458,8 +463,8 @@ jobs:
           mkdir -p stage/components
           arch_args=""
           for n in $(echo "$ARCH_NUMBERS" | tr ';' ' '); do arch_args="$arch_args --arch sm_$n"; done
-          dsv41_arg=""
-          if [ "$BUILD_DSV41" = true ]; then dsv41_arg=--require-dsv41; fi
+          # --require-dsv41 is gone with the DeepSeek engine (0.2.14 retires
+          # DeepSeek V4.1-Flash), and so is strata_control's `dsv41` feed member.
           "$PYTHON" packaging/package_engine.py \
             --src stage/engine --backend cuda --platform linux-aarch64 \
             --version "$STRATA_VERSION" --out stage/components \
@@ -467,8 +472,7 @@ jobs:
             --min-driver "nvidia=$MIN_DRIVER" \
             --build-id "el8-cuda${CUDA_FULL}-$(git rev-parse --short=12 HEAD)" \
             --include SYSTEM-LIBS.txt --include 'libstrata_kq*' \
-            --include DEPLOY.txt --include verify-engine.sh --include probe-cpu.sh \
-            $dsv41_arg
+            --include DEPLOY.txt --include verify-engine.sh --include probe-cpu.sh
           pkg=$(find stage/components -mindepth 1 -maxdepth 1 -type d -print -quit)
           test -n "$pkg"
           echo "STRATA_PKG=$pkg" >> "$GITHUB_ENV"
@@ -495,7 +499,7 @@ jobs:
             ln -s "$CUDA_HOME/lib64/stubs/libcuda.so" "$stub/libcuda.so.1"
           fi
           export LD_LIBRARY_PATH="$stub:$STRATA_PKG"
-          for exe in strata strata-dsv41 strata-vision; do
+          for exe in strata strata-vision; do
             [ -f "$STRATA_PKG/$exe" ] || continue
             echo "== ldd -r $exe =="
             ldd -r "$STRATA_PKG/$exe" | tee /tmp/ldd-exe.txt
@@ -507,7 +511,7 @@ jobs:
             fi
           done
           echo "== --version =="
-          for exe in strata strata-dsv41; do
+          for exe in strata; do
             [ -f "$STRATA_PKG/$exe" ] || continue
             if "$STRATA_PKG/$exe" --version; then
               echo "$exe --version: ok"
@@ -525,8 +529,8 @@ jobs:
           tar -tzf "$name" > /tmp/strata-package-list.txt
           vision_note="no (text-only)"
           if [ -f "$STRATA_PKG/strata-vision" ]; then vision_note="yes"; fi
-          dsv41_note="no"
-          if [ -f "$STRATA_PKG/strata-dsv41" ]; then dsv41_note="yes"; fi
+          kq_note="no (STRATA_MMQ=OFF, the default)"
+          if [ -f "$STRATA_PKG/libstrata_kq.so" ]; then kq_note="yes"; fi
           {
             echo "### Engine package"
             echo ""
@@ -542,7 +546,7 @@ jobs:
             echo "| arm64 -march | $ARM64_ARCH |"
             echo "| min driver | $MIN_DRIVER |"
             echo "| strata-vision | $vision_note |"
-            echo "| strata-dsv41 | $dsv41_note |"
+            echo "| libstrata_kq.so | $kq_note |"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload engine tar.gz
