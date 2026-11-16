@@ -27,14 +27,25 @@ name: Build Strata engine (EL8 / aarch64 / CUDA 13 / NVFP4)
 #      libstrata_kq.so, strata-dsv41, strata-vision, the CUDA runtime
 #      libraries, EL8's libstdc++/libgomp, BUILD.json, SYSTEM-LIBS.txt,
 #      engine-component.json, DEPLOY.txt and the two check scripts.
-#   2. strata-pydeps-<ver>-py311-aarch64-el8.tar.gz
-#      An offline wheelhouse for the Python CLI/API-server dependencies. It is
-#      NOT part of the engine package; see DEPLOY.txt for why it exists.
-#   3. optional: with `release_tag` set, both are attached to that GitHub
-#      Release. See the publish job for why this starts no other workflow.
+#   2. strata-terminal-<ver>-linux-aarch64.tar.gz
+#      The self-contained Terminal: a private CPython 3.12.15 plus every locked
+#      runtime wheel (numpy, pillow, jinja2 ... packaging/locks/
+#      runtime-linux-aarch64-cp312.txt), the CLI and setup. The host needs no
+#      system Python at all, which is the point on the offline box: UOS 20 ships
+#      3.7.9, far below the 3.10 the CLI needs. 1 + 2 are the whole offline set.
+#   3. strata-pydeps-<ver>-py311-aarch64-el8.tar.gz (optional)
+#      An offline wheelhouse for the Python CLI/API-server dependencies, for a
+#      host that already has Python 3.11 and is driven from a source checkout.
+#      It is NOT part of the engine package; see DEPLOY.txt for why it exists.
+#      The Terminal archive (2) makes it unnecessary; `with_python_wheels=false`
+#      skips it.
+#   4. optional: with `release_tag` set, the artifacts are attached to that
+#      GitHub Release. See the publish job for why this starts no other
+#      workflow.
 #
-# Defaults build the full engine (dsv41 + vision + wheelhouse); set any of
-# build_dsv41 / build_vision / with_python_wheels to 'false' for a faster run.
+# Defaults build the full engine (dsv41 + vision) and the Terminal archive; set
+# build_dsv41 / build_vision / with_terminal / with_python_wheels to 'false' for
+# a faster run.
 
 on:
   workflow_dispatch:
@@ -59,8 +70,13 @@ on:
         required: false
         default: 'true'
         type: string
+      with_terminal:
+        description: 'Also build the self-contained Terminal archive (private CPython 3.12 + every locked wheel). Together with the engine this is the whole offline set; false skips it.'
+        required: false
+        default: 'true'
+        type: string
       with_python_wheels:
-        description: 'Also build the offline Python wheelhouse artifact'
+        description: 'Also build the offline Python wheelhouse artifact (only for a host driven from a source checkout with Python 3.11; the Terminal archive makes it unnecessary)'
         required: false
         default: 'true'
         type: string
@@ -369,13 +385,18 @@ jobs:
             * NVIDIA driver >= 580.65, official .run installer, stable branch.
               It provides libcuda.so.1. Do NOT install a CUDA Toolkit and do
               NOT put libcuda.so.1 in this directory.
-            * Python 3.10+ for the CLI/API-server layer (UOS/CentOS 8 ship 3.6,
-              which is too old - install a newer interpreter separately).
-            * for `strata serve` / `strata bench`, the packages in
-              requirements.txt (jinja2, pyyaml, regex, psutil, requests, numpy,
-              pillow and their dependencies). On an offline box use the separate
-              strata-pydeps-*.tar.gz wheelhouse and its install-python-deps.sh.
-              `strata --help`, `status`, `monitor` are stdlib-only.
+            * Python 3.10+ for the CLI/API-server layer. UOS/CentOS 8 ship 3.6
+              or 3.7, which is too old. Two ways to get one:
+                - strata-terminal-<ver>-linux-aarch64.tar.gz (recommended): a
+                  self-contained bundle with its own CPython 3.12 and every
+                  package the CLI and the API server need. Extract it anywhere
+                  and run bin/strata; no system Python is involved at all.
+                - a Python 3.11 you install yourself, plus the separate
+                  strata-pydeps-*.tar.gz wheelhouse and its
+                  install-python-deps.sh, driven from a source checkout with
+                  STRATA_PYTHON=/path/to/python3.11 ./bin/strata.
+              `strata --help`, `status`, `monitor` alone are stdlib-only, so a
+              bare 3.10+ interpreter can run them without any of the above.
 
           INSTALL
             # <components> is ~/.local/share/strata/components by default,
@@ -387,7 +408,15 @@ jobs:
             # keep every file together: engine-component.json hashes them all
             ./verify-engine.sh .        # needs binutils (readelf/objdump)
             ./probe-cpu.sh              # best -march for a possible rebuild
-            strata status               # from the Python CLI layer
+
+            # the Python half: extract beside it, add bin/ to PATH
+            tar -xzf strata-terminal-*.tar.gz -C /opt
+            TERM=/opt/strata-terminal-<version>-linux-aarch64
+            export PATH="$TERM/bin:$PATH"
+            export STRATA_COMPONENTS_DIR="${COMPONENTS%/engine}"
+            strata --version            # the bundle's own CPython 3.12
+            strata components engines   # the package above must be listed
+            strata status
 
           WHY IT RUNS WITHOUT A TOOLKIT
             libcudart / libcublas / libcublasLt and EL8's libstdc++ / libgomp
@@ -594,6 +623,75 @@ jobs:
             strata-pydeps-*.tar.gz.sha256
           if-no-files-found: error
 
+  # The Terminal archive: the self-contained Python half of the offline set.
+  # It carries a private CPython 3.12.15 and every wheel of
+  # packaging/locks/runtime-linux-aarch64-cp312.txt, so the host needs no system
+  # Python - the production box ships 3.7.9, far below the 3.10 the CLI needs.
+  # Engine tar.gz + this archive is the whole install; nothing else is fetched.
+  #
+  # Built here, in the same almalinux:8 container as the engine, for two
+  # reasons: package_terminal.py refuses to build for another target (it
+  # installs the lock with the bundled interpreter, which only runs on the
+  # target's CPU/OS), and every cp312 wheel must stay at manylinux_2_28 or
+  # below because the target's glibc is 2.28.
+  terminal:
+    name: Terminal archive / linux-aarch64
+    if: ${{ (inputs.with_terminal || 'true') != 'false' }}
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
+    container:
+      image: almalinux:8
+    steps:
+      - name: System dependencies (EL8 / dnf)
+        run: |
+          # packaging/package_terminal.py needs Python 3.10+ itself; EL8's
+          # python3 is 3.6. The archive's own interpreter is downloaded by the
+          # script from its pin and checked against a SHA-256.
+          dnf -y install --setopt=install_weak_deps=False \
+            git ca-certificates tar gzip python3.11 python3.11-pip
+          python3.11 --version
+
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Build the archive
+        run: |
+          # The label is the app/Terminal version (apps/desktop/package.json),
+          # not the engine's, so `strata --version` inside the bundle and the
+          # asset name agree with the release. Empty: the script reads the
+          # source itself.
+          ver=$(sed -n 's/.*"version": "\([0-9][0-9.]*\)".*/\1/p' apps/desktop/package.json | head -1)
+          if [ -n "$ver" ]; then set -- --version "$ver"; else set --; fi
+          echo "Terminal version: ${ver:-from source}"
+          mkdir -p dist
+          # --commit: an archive has no .git, and `strata bench run` records the
+          # commit; a standard benchmark without one is nonconforming.
+          python3.11 packaging/package_terminal.py --target linux-aarch64 \
+            "$@" --commit "$GITHUB_SHA" --out dist
+          cd dist
+          for f in strata-terminal-*.tar.gz; do sha256sum "$f" > "$f.sha256"; done
+          ls -lh
+          # A layout assertion, not a smoke test: the launcher must find its own
+          # private interpreter. Without python/bin/python3 the bundle silently
+          # falls back to whatever Python the host has, which is the bug this
+          # archive exists to prevent.
+          tar -tzf strata-terminal-*.tar.gz > /tmp/terminal-list.txt
+          for part in /bin/strata /python/bin/python3 /VERSION /COMMIT; do
+            grep -qE -- "${part}\$" /tmp/terminal-list.txt || {
+              echo "error: the archive carries no $part" >&2; exit 1; }
+          done
+
+      - name: Upload the Terminal archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: strata-terminal-linux-aarch64
+          path: |
+            dist/strata-terminal-*.tar.gz
+            dist/strata-terminal-*.tar.gz.sha256
+            dist/strata-terminal-*.manifest.json
+          if-no-files-found: error
+
   # Attach the tar.gz artifacts to a GitHub Release.
   #
   # Why this cannot start another workflow:
@@ -610,8 +708,12 @@ jobs:
   #     can never publish by accident.
   publish:
     name: publish to release
-    needs: [engine, python-wheels]
-    if: ${{ always() && github.event_name == 'workflow_dispatch' && (inputs.release_tag || '') != '' && needs.engine.result == 'success' }}
+    needs: [engine, terminal, python-wheels]
+    # The engine is the package; the Terminal archive is the Python half, and a
+    # release with only one of them cannot be installed on the offline box. A
+    # skipped terminal job (with_terminal=false) is accepted: then the caller
+    # chose the source-checkout route and takes the wheelhouse instead.
+    if: ${{ always() && github.event_name == 'workflow_dispatch' && (inputs.release_tag || '') != '' && needs.engine.result == 'success' && (needs.terminal.result == 'success' || needs.terminal.result == 'skipped') }}
     runs-on: ubuntu-latest
     permissions:
       contents: write        # this job only; the build jobs stay read-only
@@ -629,10 +731,19 @@ jobs:
           path: dist
 
       - name: Check the artifacts
+        env:
+          # A skipped terminal job is legitimate (with_terminal=false); a
+          # successful one with no archive in dist is a broken download.
+          TERMINAL_EXPECTED: ${{ needs.terminal.result == 'success' && '1' || '0' }}
         run: |
           set -eu
           test -n "$(find dist -name 'strata-engine-*.tar.gz' -print -quit)" || {
             echo "error: no engine tar.gz was downloaded"; exit 1; }
+          if [ "$TERMINAL_EXPECTED" = 1 ]; then
+            test -n "$(find dist -name 'strata-terminal-*.tar.gz' -print -quit)" || {
+              echo "error: the terminal job succeeded but no Terminal archive was downloaded" >&2
+              exit 1; }
+          fi
           cd dist
           ls -lh
           for f in *.sha256; do
@@ -661,7 +772,7 @@ jobs:
             echo "error: gh sees '$full_name', expected '$repo'" >&2
             exit 1
           }
-          notes="Built from ${GITHUB_SHA:0:12} by build-cuda-el8-aarch64.yml. The engine tar.gz is self-contained (only the NVIDIA driver is needed on the host); the pydeps tar.gz is the offline Python wheelhouse. See DEPLOY.txt inside the engine package."
+          notes="Built from ${GITHUB_SHA:0:12} by build-cuda-el8-aarch64.yml. The engine tar.gz and the Terminal archive are the whole offline set: the engine needs only the NVIDIA driver, and the Terminal archive carries its own CPython 3.12 plus every locked wheel, so the host needs no system Python. The pydeps tar.gz is the alternative wheelhouse for a host driven from a source checkout. See DEPLOY.txt inside the engine package."
           # A preflight, never a silent overwrite: re-publishing the same tag
           # is an explicit opt-in (allow_replace), not a surprise.
           if gh release view "$TAG" --repo "$repo" >/dev/null 2>&1; then
