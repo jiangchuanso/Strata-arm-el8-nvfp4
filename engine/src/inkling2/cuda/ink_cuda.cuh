@@ -26,6 +26,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <chrono>
+#include <stdexcept>
+#include <string>
 #include "strata/core/device_error_exit.hpp"
 #include "strata/platform/cgroup_mem.hpp"
 
@@ -55,10 +57,35 @@ inline double now_s() {
     return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
+// A device allocation that did not fit. While start-up code runs with ink_alloc_throws() set (the backend's init), a failed
+// allocation throws this so the backend can retry with a smaller workspace (#6644 #6792); everywhere else it ends the engine
+// the way every other CUDA error does.
+struct InkAllocFailure : std::runtime_error {
+    explicit InkAllocFailure(const std::string& m) : std::runtime_error(m) {}
+};
+inline bool& ink_alloc_throws() {
+    static thread_local bool v = false;
+    return v;
+}
+// Names the request and the card's free memory ("CUDA error 2 at ink_cuda.cuh:54" alone cannot be acted on).
+inline void ink_alloc_failed(cudaError_t e, size_t bytes, const char* file, int line) {
+    size_t vf = 0, vt = 0;
+    cudaGetLastError();
+    cudaMemGetInfo(&vf, &vt);
+    char _what[300];
+    std::snprintf(_what, sizeof(_what), "strata-inkling CUDA error %d at %s:%d (allocating %.0f MiB; %.0f of %.0f MiB free)",
+                  (int)e, file, line, (double)bytes / 1048576.0, (double)vf / 1048576.0, (double)vt / 1048576.0);
+    if (ink_alloc_throws()) throw InkAllocFailure(_what);
+    strata::core::exit_device_error(_what, cudaGetErrorString(e));
+}
+
 template <typename T>
 inline T* dalloc(size_t count) {
     T* p = nullptr;
-    if (count > 0) INK_CK(cudaMalloc(&p, count * sizeof(T)));
+    if (count > 0) {
+        const cudaError_t e = cudaMalloc(&p, count * sizeof(T));
+        if (e != cudaSuccess) ink_alloc_failed(e, count * sizeof(T), __FILE__, __LINE__);
+    }
     return p;
 }
 
@@ -96,7 +123,16 @@ inline strata::inkling2::ArchProfile current_arch_profile(int dev = 0) {
 // cudaMemGetInfo subtracts reclaimable OS page cache (like the 19 GB .strata file just read!),
 // so take max(cuda_free, /proc/meminfo MemAvailable) to prevent false hybrid spill!
 inline cudaError_t ink_cuda_mem_info(size_t* vfree, size_t* vtot, int dev = -1) {
+    // #7093: cudaMemGetInfo answers for the CURRENT device, so `dev` has to be made current for the call: the layer split asked for
+    // a peer card's memory while the primary card was current and got the primary's, so the peer's expert budget was far too small
+    // (an RTX 3060 pair, SQ-20: the peer was budgeted 7.2 GiB with 10.8 GiB free), and its overflow became host experts it cannot compute.
+    int prev_dev = -1;
+    if (dev >= 0) {
+        int cur_dev = -1;
+        if (cudaGetDevice(&cur_dev) == cudaSuccess && cur_dev != dev && cudaSetDevice(dev) == cudaSuccess) prev_dev = cur_dev;
+    }
     cudaError_t ce = cudaMemGetInfo(vfree, vtot);
+    if (prev_dev >= 0) cudaSetDevice(prev_dev);
     if (ce != cudaSuccess) return ce;
 #if defined(__linux__)
     int cur = dev;
@@ -184,6 +220,8 @@ enum InkFmt : int {
     FMT_F32   = 101,
     FMT_BF16  = 102,
     FMT_F16   = 103,
+    FMT_Q8_0  = 104,   // GGUF Q8_0 table as stored, row by row: [N][K/32] fp16 scales, then [N][K] int8 (the embedding; CUDA backend only)
+    FMT_Q8_0F = 105,   // GGUF Q8_0 dense matrix in mma fragment order for k_ink_gemm_q8f (CUDA, sm_80+): see the loader
 };
 
 __host__ __device__ constexpr int ink_sb_bytes(int fmt) {
